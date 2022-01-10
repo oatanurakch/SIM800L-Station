@@ -9,6 +9,9 @@
 #include <ArduinoJson.h>
 #include <SoftwareSerial.h>
 #include <esp_task_wdt.h>
+#include <EEPROM.h>
+
+#define EEPROM_SIZE 1
 
 // Set serial for AT commands (to the module SIM800L)
 #define SerialAT Serial1
@@ -28,10 +31,25 @@ SoftwareSerial Winddirection_Serial;
 #define TXWinddirection 18
 #define RXWinddirection 19
 
-#define SW 15
-
 // Address for calling Data from all sensor
 byte request[] = {0x02, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0x39};
+
+// Define how you're planning to connect to the internet
+#define TINY_GSM_USE_GPRS true
+#define TINY_GSM_USE_WIFI false
+
+// Network Detail
+const char apn[]      = "True internet";
+const char gprsUser[] = "true";
+const char gprsPass[] = "true";
+
+// MQTT details
+const char* broker = "139.59.255.80";
+const char* topicOut = "windstation/Node1Pub";
+const char* topicIn = "windstation/Node1Sub";
+
+StaticJsonDocument<256> doc;
+char message[256];
 
 float WindSpeed;
 float WindSpeed_hr;
@@ -44,23 +62,8 @@ int count = 0;
 float adcsum = 0;
 float speedsum = 0;
 int countwindspeed = 0;
-
-// Define how you're planning to connect to the internet
-#define TINY_GSM_USE_GPRS true
-#define TINY_GSM_USE_WIFI false
-
-// Network Detail
-const char apn[]      = "internet-name";
-const char gprsUser[] = "userinternet";
-const char gprsPass[] = "passwordinternet";
-
-// MQTT details
-const char* broker = "broker-name";
-const char* topicOut = "publish-topic";
-const char* topicIn = "subscribe-topic";
-
-StaticJsonDocument<256> doc;
-char message[256];
+bool stateconfig = false;
+int address = 0;
 
 TinyGsm modem(SerialAT);
 TinyGsmClient client(modem);
@@ -68,6 +71,7 @@ PubSubClient mqtt(client);
 
 // timer function
 hw_timer_t * timer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool state = false;
 
 // timer function Read Windspeed
@@ -76,12 +80,16 @@ volatile bool stateWindspeed = false;
 
 //ISR Function Send Data
 void IRAM_ATTR onTimer(){
+   portENTER_CRITICAL_ISR(&timerMux);
    state = !state;
+   portEXIT_CRITICAL_ISR(&timerMux);
 }
 
 //ISR Function Read Windspeed
 void IRAM_ATTR _onTimer(){
+   portENTER_CRITICAL_ISR(&timerMux);
    stateWindspeed = !stateWindspeed;
+   portEXIT_CRITICAL_ISR(&timerMux);
 }
 
 void setup() {
@@ -89,31 +97,20 @@ void setup() {
   Serial.begin(115200);
   Serial.setTimeout(50);
   SerialAT.setTimeout(50);
-  
-  delay(100);
-  
   setupModem();
-
   Serial.println("wait . . .");
-
-//Serial begin Module SIM800L 
   SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
-
 //Serial begin Wind Speed Sensor
   Windspeed_Serial.begin(9600, SWSERIAL_8N1, RXWindspeed, TXWindspeed);
-  
 //Serial begin Wind Direction Sensor
   Winddirection_Serial.begin(9600, SWSERIAL_8N1, RXWinddirection, TXWinddirection);
-  
   delay(5000);
   Serial.println("Initializing modem...");
-  modem.restart();
-
+  modem.restart();  
   String modemInfo = modem.getModemInfo();
   Serial.print("Modem Info: ");
   Serial.println(modemInfo);
-
-  while(!modem.waitForNetwork()){
+    while(!modem.waitForNetwork()){
     Serial.println("Fail, Try to connected");
     delay(1000);
     ESP.restart();
@@ -155,25 +152,41 @@ void setup() {
   timerAlarmWrite(timer, 60000000, true);
   timerAlarmEnable(timer);
 
-//Timer Read Date Windspeed
   timerWindspeed = timerBegin(2, 80, true);
   timerAttachInterrupt(timerWindspeed, &_onTimer, true);
   timerAlarmWrite(timerWindspeed, 5000000, true);
   timerAlarmEnable(timerWindspeed);
   
+  EEPROM.begin(EEPROM_SIZE);
+  int state_save = EEPROM.read(address);
+  Serial.println("State previous: " + String(state_save));
+  if(state_save == 1){
+    stateconfig = true;
+  }else{
+    stateconfig = false;
+  }
+  
 }
 
 void loop() {
-
-//  Restart ESP32 when ESP32 works about 1 hr.
+  
   if(millis() == 14400000){
     ESP.restart();
   }
+  
+  // stage read data
+  if(stateWindspeed == true){
+  // Call Function Read Wind Speed
+      windSpeed_Battery();
+      stateWindspeed = !stateWindspeed;
+  }
+  
+  if(!mqtt.connected()){    
+    Serial.println("Retry");
+    while(mqttConnect()==false) continue;
+  }
 
-  int stateswitch = analogRead(SW);
-  float _stateswitch = stateswitch * 3.3 / 4095.0;
-
-  if(_stateswitch >= 0.6){
+  if(!stateconfig){
     delay(5000);
     Serial.println("Config Mode");
 
@@ -196,22 +209,27 @@ void loop() {
         mqtt.loop();
       }
 
-    doc["WDD2"] = DirectionDegree;
+    doc["wd1"] = DirectionDegree;
+    doc["dev"] = "D1x";
+    doc["st1"] = stateconfig;
     serializeJson(doc, message);
     Serial.print("MQTT pub = ");
     Serial.println(mqtt.publish(topicOut, message, sizeof(message)));
     TIME = "";
     doc.clear();
-    mqtt.disconnect();
  
   }
   
-  if(state == true && _stateswitch == 0){
-
-//    Call Function Read Wind Direction
-      WindDirection();
+  if(mqtt.connected()){
+    mqtt.loop();
     
-//    AT Command call Time with SIM800L 
+    if(state == true && stateconfig){
+      WindDirection();
+      WindSpeed = (speedsum / countwindspeed) / 10.0;
+      int value_signal = modem.getSignalQuality();
+      int RSSI_GPRS = (value_signal + (value_signal - 1)) - 112;
+      
+//    AT Command call Time with SIM800L
       SerialAT.println("AT+CCLK?");
       SerialAT.flush();
       Time = SerialAT.readString();
@@ -224,44 +242,19 @@ void loop() {
           TIME += Time[i];
         }
       }
+//      Serial.println(Time);
 
-//    Convert value of signal to RSSI
-      int value_signal = modem.getSignalQuality();
-      int RSSI_GPRS = (value_signal + (value_signal - 1)) - 112;
-
-//    Add member to document before serialize 
-      WindSpeed = (speedsum / countwindspeed) / 10.0;
-      doc["T2"] = TIME;
-      doc["W2"] = WindSpeed;
-      doc["WHR2"] = WindSpeed * 3.6;
-      doc["WD2"] = Direction;
-      doc["WDD2"] = DirectionDegree;
-      doc["lat2"] = 17.92844;
-      doc["long2"] = 102.79028;
-      doc["S2"] = RSSI_GPRS;
-      doc["batt2"] = ((adcsum / count) * 4.2) / 4230;
+      doc["dev"] = "D1x";
+      doc["ws1"] = WindSpeed;
+      doc["ws_hr1"] = WindSpeed * 3.6;
+      doc["wd1"] = DirectionDegree;
+      doc["t1"] = TIME;
+      doc["s1"] = RSSI_GPRS;
+      doc["batt1"] = ((adcsum / count) * 4.2) / 4095;
+      doc["st1"] = stateconfig;
       
       serializeJson(doc, message);
-      
-      //Check Status of GPRS
-      while(!modem.isGprsConnected()){
-        Serial.println("Try Connect GPRS");
-        modem.gprsConnect(apn, gprsUser, gprsPass);
-        continue;
-      }
-        
-      //Check status of mqtt
-      if(!mqtt.connected()){
-        while(mqttConnect() == false) continue;
-      }
-        
-      //Check status of mqtt
-      if(mqtt.connected()){
-        mqtt.loop();
-      }
-
-  //MQTT and GPRS is connected
-    if(modem.isGprsConnected() && mqtt.connected() && TIME != ""){
+      if(modem.isGprsConnected() && mqtt.connected() && TIME != ""){
       Serial.print("MQTT pub = ");
       Serial.print(mqtt.publish(topicOut, message, sizeof(message)));
       Serial.print(" MQTT con = ");
@@ -287,29 +280,19 @@ void loop() {
       speedsum = 0;
       countwindspeed = 0;
 
-      mqtt.disconnect();
-
     }
     
   }
-  
-  // stage read data
-  if(stateWindspeed == true){
-    
-  //    Call Function Read Wind Speed
-      windSpeed_Battery();
       
-      stateWindspeed = !stateWindspeed;
-  }
-  
-//  watchdog reset
-    esp_task_wdt_reset();
-    
+    }
+     
+  esp_task_wdt_reset();
+
 }
 
 boolean mqttConnect()
 {
-  if(!mqtt.connect("windstation_2"))
+  if(!mqtt.connect("windstation_1"))
   {
     Serial.print(".");
     return false;
@@ -318,11 +301,30 @@ boolean mqttConnect()
   return mqtt.connected();
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int len)
+void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
-  Serial.print("Message receive: ");
-  Serial.write(payload, len);
-  Serial.println();
+//  Serial.print("Message arrived on topic: ");
+//  Serial.print(topic);
+//  Serial.print(". Message: ");
+  StaticJsonDocument<256> doc1;
+  deserializeJson(doc1, payload, length);
+  serializeJson(doc1, Serial);
+  Serial.print("\n");
+  int _config = doc1["config"];
+  if(_config == 1){
+    stateconfig = true;
+    EEPROM.write(address, _config);
+    EEPROM.commit();
+    int x = EEPROM.read(address);
+    Serial.println("State: " + String(x));
+  }else if(_config == 0){
+    stateconfig = false;
+    EEPROM.write(address, _config);
+    EEPROM.commit();
+    int x = EEPROM.read(address);
+    Serial.println("State: " + String(x));
+  }
+
 }
 
 //Function Read Windspeed
@@ -337,6 +339,7 @@ void windSpeed_Battery(){
   
 //      Serial.print("Wind Calculation : ");
       int WindSpeedData = (windspeeddatacallback[3] + windspeeddatacallback[4]);
+//      Serial.println(WindSpeedData);
       speedsum += WindSpeedData;
       countwindspeed++;
       
@@ -350,7 +353,7 @@ void windSpeed_Battery(){
 //      Serial.println(" km/hr");
 
 //    Battery
-      int adc = analogRead(33) + 938;
+      int adc = analogRead(33) + 780;
       adcsum += adc;
       count++;
       
@@ -368,6 +371,7 @@ void WindDirection(){
   
 //      Serial.print("Wind Direction : ");
       int WinddirectionDEC = (winddirectiondatacallback[3] + winddirectiondatacallback[4]);
+//      Serial.println(WinddirectionDEC);
 //      Serial.print(WinddirectionDEC, DEC);
 //      Serial.print(" : ");
   
